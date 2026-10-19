@@ -1,14 +1,15 @@
-"""Morning weather -> Telegram: what to bring today (umbrella, sunscreen, mask).
+"""Morning weather -> Telegram: what to bring today (umbrella, sunscreen, mask),
+plus an update during the day if rain, snow or fine dust shows up that the morning message didn't mention.
 
 Telegram commands:
-  /location Seoul    set your location (city name in any language, e.g. Tokyo, 울산, "Portland, US")
+  /location Seoul    set your location (city name in English or the local language, e.g. Tokyo, "Portland, US")
   /time 5:00         set the daily message time (local time of your location; also 7am, 18:30, 0630)
   /now               send today's forecast right now
   /settings          show your location and time
 
 Data: Open-Meteo (free, no API key) for forecast, UV index and air quality.
-Run periodically by GitHub Actions: handle commands -> send the daily message if it's time -> save state.
-The repo is public, so the state (your location) is saved encrypted in state.enc with the STATE_KEY secret,
+Run periodically by GitHub Actions: handle commands -> daily message -> hourly update check -> save state.
+The repo is public, so the state (your location and settings) is saved encrypted in state.enc with the STATE_KEY secret,
 and logs never show your location or messages.
 No external packages (Python standard library only).
 """
@@ -36,6 +37,9 @@ MENU_VERSION = 1  # bump when COMMANDS change so Telegram's menu gets refreshed
 DEFAULT_TIME = "05:00"
 SEND_WINDOW_HOURS = 3  # if runs were delayed past this, skip the day instead of sending a stale "morning" message
 DAY_HOURS = range(6, 24)  # hours that count for "today" (rain at 3am doesn't need an umbrella)
+UPDATE_UNTIL_HOUR = 21  # hourly "weather got worse" checks stop at this local hour
+RAIN_NONE, RAIN_MAYBE, RAIN_YES, RAIN_SNOW = 0, 1, 2, 3  # ordered: a higher value is worse
+DUST_ORDER = ["good", "normal", "bad", "very bad"]
 
 GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
@@ -43,12 +47,13 @@ AIR_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 
 HELP = (
     "Commands:\n"
-    "/location CITY — set your location (any language: Seoul, 울산, Tokyo)\n"
+    "/location CITY — set your location (English or local name: Seoul, Tokyo)\n"
     "   Same name in many countries? Add the country: /location Portland, US\n"
     "/time HH:MM — daily message time (e.g. /time 5:00, /time 7am)\n"
     "/now — today's forecast right now\n"
     "/settings — your location and time\n\n"
-    "Every morning you get what to bring: ☔ umbrella · 🧴 sunscreen · 😷 mask."
+    "Every morning you get what to bring: ☔ umbrella · 🧴 sunscreen · 😷 mask.\n"
+    "If rain, snow or fine dust shows up later in the day, you get an update."
 )
 COMMANDS = [
     {"command": "location", "description": "Set location: /location Seoul"},
@@ -89,7 +94,7 @@ def send(text):
 
 # ---------- Location ----------
 def find_place(query):
-    """'Seoul' / '울산' / 'Portland, US' -> best matching place dict, or None."""
+    """'Seoul' / a local-language name / 'Portland, US' -> best matching place dict, or None."""
     name, _, country = (x.strip() for x in query.partition(","))
     results = get_json(GEO_URL, name=name, count=10, language="en", format="json").get("results") or []
     if country:
@@ -140,73 +145,93 @@ def hour_span(hours):
     return f"{hours[0]:02d}:00–{hours[-1] + 1:02d}:00"
 
 
-def today_brief(place):
-    """The morning message: what to bring, then temperatures."""
-    tz = ZoneInfo(place["tz"])
-    today = datetime.now(tz).date().isoformat()
+def fetch_forecast(place):
+    """(hourly forecast, daily temperatures, hourly air quality or None) from Open-Meteo, in local time."""
     fc = get_json(FORECAST_URL, latitude=place["lat"], longitude=place["lon"], timezone=place["tz"], past_days=1, forecast_days=1,
                   hourly="precipitation_probability,precipitation,snowfall,uv_index",
                   daily="temperature_2m_max,temperature_2m_min")
-    hourly = fc["hourly"]
-    col = lambda k: hourly.get(k) or [None] * len(hourly["time"])  # some places lack a variable -> treat as unknown
-    pct, mm, snow, uvi = col("precipitation_probability"), col("precipitation"), col("snowfall"), col("uv_index")
-    rows = [  # (hour, rain %, rain mm, snow cm, uv) for today's daytime
-        (int(t[11:13]), pct[i], mm[i], snow[i], uvi[i])
-        for i, t in enumerate(hourly["time"]) if t.startswith(today) and int(t[11:13]) in DAY_HOURS
-    ]
-    bring, notes = [], []
-
-    # ☔ Rain / snow
-    rainy = [h for h, pct, mm, _, _ in rows if (pct or 0) >= 50 or (mm or 0) >= 0.5]
-    maybe = [h for h, pct, _, _, _ in rows if 30 <= (pct or 0) < 50]
-    snowy = [h for h, _, _, cm, _ in rows if (cm or 0) > 0]
-    top = max((pct or 0 for _, pct, _, _, _ in rows), default=0)
-    if snowy:
-        bring.append(f"❄️ Snow — {hour_span(snowy)}, take an umbrella and good shoes")
-    elif rainy:
-        bring.append(f"☔ Umbrella — rain likely {hour_span(rainy)} (up to {top}%)")
-    elif maybe:
-        bring.append(f"🌂 Small umbrella just in case — {top}% chance around {hour_span(maybe)}")
-
-    # 🧴 Sunscreen
-    uv = [(h, u) for h, _, _, _, u in rows if u is not None]
-    peak = max((u for _, u in uv), default=0)
-    if peak >= 6:
-        strong = [h for h, u in uv if u >= 6]
-        bring.append(f"🧴 Sunscreen — UV {level(peak, UV_LEVELS)} ({peak:.0f}), strongest {hour_span(strong)}")
-    elif peak >= 3:
-        bring.append(f"🧴 Sunscreen if you're outside long — UV {level(peak, UV_LEVELS)} ({peak:.0f})")
-
-    # 😷 Fine dust
     try:
         air = get_json(AIR_URL, latitude=place["lat"], longitude=place["lon"], timezone=place["tz"], forecast_days=1,
                        hourly="pm10,pm2_5")["hourly"]
-        day = [i for i, t in enumerate(air["time"]) if t.startswith(today) and int(t[11:13]) in DAY_HOURS]
-        pm25 = max((air["pm2_5"][i] or 0 for i in day), default=0)
-        pm10 = max((air["pm10"][i] or 0 for i in day), default=0)
-        worst = max(level(pm25, PM25_LEVELS), level(pm10, PM10_LEVELS), key=[n for _, n in PM25_LEVELS].index)
-        if worst in ("bad", "very bad"):
-            bring.append(f"😷 Mask — fine dust {worst} (PM2.5 {pm25:.0f} · PM10 {pm10:.0f})")
-        else:
-            notes.append(f"🌫 Air {worst}")
-    except Exception as e:  # air data missing for some places -> the rest of the message still goes out
+    except Exception as e:  # air data missing for some places -> the rest still works
         print(f"air quality failed: {why(e)}")
+        air = None
+    return fc["hourly"], fc["daily"], air
 
-    # 🌡 Temperature (vs yesterday)
-    daily = fc["daily"]
-    hi, lo = daily["temperature_2m_max"][-1], daily["temperature_2m_min"][-1]
-    temp = f"🌡 {hi:.0f}° / {lo:.0f}°"
-    if len(daily["time"]) > 1 and daily["temperature_2m_max"][0] is not None:
-        diff = hi - daily["temperature_2m_max"][0]
+
+def assess(place, hours):
+    """What to bring for the given hours of today, as plain values (so morning and later checks can be compared)."""
+    today = datetime.now(ZoneInfo(place["tz"])).date().isoformat()
+    hourly, daily, air = fetch_forecast(place)
+    col = lambda data, k: data.get(k) or [None] * len(data["time"])  # some places lack a variable -> treat as unknown
+    pct, mm, snow, uvi = (col(hourly, k) for k in ("precipitation_probability", "precipitation", "snowfall", "uv_index"))
+    rows = [(int(t[11:13]), pct[i] or 0, mm[i] or 0, snow[i] or 0, uvi[i])  # (hour, rain %, rain mm, snow cm, uv)
+            for i, t in enumerate(hourly["time"]) if t.startswith(today) and int(t[11:13]) in hours]
+    a = {"rain": RAIN_NONE, "rain_hours": [], "top": max((r[1] for r in rows), default=0),
+         "uv": max((r[4] for r in rows if r[4] is not None), default=0), "uv_hours": [], "dust": "", "pm25": 0, "pm10": 0}
+    snowy = [h for h, _, _, cm, _ in rows if cm > 0]
+    rainy = [h for h, p, mm_, _, _ in rows if p >= 50 or mm_ >= 0.5]
+    maybe = [h for h, p, _, _, _ in rows if 30 <= p < 50]
+    for kind, found in ((RAIN_SNOW, snowy), (RAIN_YES, rainy), (RAIN_MAYBE, maybe)):
+        if found:
+            a["rain"], a["rain_hours"] = kind, found
+            break
+    a["uv_hours"] = [h for h, *_, u in rows if u is not None and u >= 6]
+    if air:
+        day = [i for i, t in enumerate(air["time"]) if t.startswith(today) and int(t[11:13]) in hours]
+        a["pm25"] = max((air["pm2_5"][i] or 0 for i in day), default=0)
+        a["pm10"] = max((air["pm10"][i] or 0 for i in day), default=0)
+        a["dust"] = max(level(a["pm25"], PM25_LEVELS), level(a["pm10"], PM10_LEVELS), key=DUST_ORDER.index)
+    a["hi"], a["lo"] = daily["temperature_2m_max"][-1], daily["temperature_2m_min"][-1]
+    a["yesterday_hi"] = daily["temperature_2m_max"][0] if len(daily["time"]) > 1 else None
+    return a
+
+
+def rain_line(a):
+    if a["rain"] == RAIN_SNOW:
+        return f"❄️ Snow — {hour_span(a['rain_hours'])}, take an umbrella and good shoes"
+    if a["rain"] == RAIN_YES:
+        return f"☔ Umbrella — rain likely {hour_span(a['rain_hours'])} (up to {a['top']}%)"
+    if a["rain"] == RAIN_MAYBE:
+        return f"🌂 Small umbrella just in case — {a['top']}% chance around {hour_span(a['rain_hours'])}"
+    return ""
+
+
+def mask_needed(a):
+    return a["dust"] in ("bad", "very bad")
+
+
+def mask_line(a):
+    return f"😷 Mask — fine dust {a['dust']} (PM2.5 {a['pm25']:.0f} · PM10 {a['pm10']:.0f})"
+
+
+def today_brief(place):
+    """The morning message, plus the values later checks compare against."""
+    a = assess(place, DAY_HOURS)
+    bring, notes = [], []
+    if a["rain"]:
+        bring.append(rain_line(a))
+    if a["uv"] >= 6:
+        bring.append(f"🧴 Sunscreen — UV {level(a['uv'], UV_LEVELS)} ({a['uv']:.0f}), strongest {hour_span(a['uv_hours'])}")
+    elif a["uv"] >= 3:
+        bring.append(f"🧴 Sunscreen if you're outside long — UV {level(a['uv'], UV_LEVELS)} ({a['uv']:.0f})")
+    if mask_needed(a):
+        bring.append(mask_line(a))
+    elif a["dust"]:
+        notes.append(f"🌫 Air {a['dust']}")
+
+    temp = f"🌡 {a['hi']:.0f}° / {a['lo']:.0f}°"
+    if a["yesterday_hi"] is not None:
+        diff = a["hi"] - a["yesterday_hi"]
         if diff <= -3:
             temp += f" ({-diff:.0f}° colder than yesterday — bring a layer)"
         elif diff >= 3:
             temp += f" ({diff:.0f}° warmer than yesterday)"
     notes.insert(0, temp)
 
-    head = f"☀️ {datetime.now(tz):%a %m/%d} · {place['name']}"
+    head = f"☀️ {datetime.now(ZoneInfo(place['tz'])):%a %m/%d} · {place['name']}"
     body = "\n".join(bring) if bring else "✅ Nothing extra to bring today"
-    return f"{head}\n\n{body}\n\n" + "\n".join(notes)
+    return f"{head}\n\n{body}\n\n" + "\n".join(notes), {"rain": a["rain"], "mask": mask_needed(a)}
 
 
 # ---------- Telegram commands ----------
@@ -219,7 +244,7 @@ def handle_commands(state):
     for u in updates:
         state["offset"] = u["update_id"] + 1
         msg = u.get("message") or {}
-        # The repo (and its Actions logs) is public: never log chat ids or message text.
+        # The repo (and its Actions logs) is public: never log chat ids, message text or places.
         if str(msg.get("chat", {}).get("id")) != CHAT_ID:
             print("  ignored a message from another chat (doesn't match TG_CHAT_ID)")
             continue
@@ -243,6 +268,7 @@ def run_command(state, cmd, arg):
             return
         state["place"] = found
         state.pop("last_sent", None)
+        state.pop("today", None)
         send(f"📍 Location set: {place_label(found)}\n"
              f"Daily message at {state.get('time', DEFAULT_TIME)} ({found['tz']} time).\n\n"
              "Wrong place? Add the country: /location Name, Country\nSee today now: /now")
@@ -261,18 +287,19 @@ def run_command(state, cmd, arg):
         if not place:
             send("📍 Set your location first: /location Seoul")
             return
-        send(today_brief(place))
+        send(today_brief(place)[0])
 
     elif cmd == "/settings":
         where = place_label(place) if place else "not set — /location Seoul"
-        send(f"⚙️ Settings\n📍 Location: {where}\n⏰ Daily message: {state.get('time', DEFAULT_TIME)}")
+        send(f"⚙️ Settings\n📍 Location: {where}\n⏰ Daily message: {state.get('time', DEFAULT_TIME)}\n"
+             f"🔔 Updates if the weather gets worse: until {UPDATE_UNTIL_HOUR}:00")
 
     else:
         intro = "" if place else "👋 First, set your location: /location Seoul\n\n"
         send(intro + HELP)
 
 
-# ---------- Daily message ----------
+# ---------- Daily message + updates ----------
 def send_daily(state):
     place = state.get("place")
     if not place:
@@ -284,8 +311,31 @@ def send_daily(state):
     if state.get("last_sent") == today or now < due:
         return
     if now - due <= timedelta(hours=SEND_WINDOW_HOURS):
-        send(today_brief(place))
+        text, seen = today_brief(place)
+        send(text)
+        state["today"] = {"date": today, "checked": now.hour, **seen}
     state["last_sent"] = today  # also marks a skipped (too late) day, so it isn't retried every run
+
+
+def check_updates(state):
+    """After the morning message, re-check hourly and message only if things got worse (rain, snow, fine dust)."""
+    place, seen = state.get("place"), state.get("today")
+    if not place or not seen:
+        return
+    now = datetime.now(ZoneInfo(place["tz"]))
+    if seen["date"] != now.date().isoformat() or now.hour >= UPDATE_UNTIL_HOUR or seen.get("checked") == now.hour:
+        return
+    seen["checked"] = now.hour
+    a = assess(place, range(now.hour, 24))  # only what's still ahead today
+    news = []
+    if a["rain"] >= RAIN_YES and a["rain"] > seen["rain"]:
+        news.append(rain_line(a) + " — changed since this morning")
+    if mask_needed(a) and not seen["mask"]:
+        news.append(mask_line(a) + " — got worse since this morning")
+    if news:
+        send(f"⚠️ Weather update · {place['name']}\n\n" + "\n".join(news))
+        seen["rain"] = max(seen["rain"], a["rain"])
+        seen["mask"] = seen["mask"] or mask_needed(a)
 
 
 # ---------- Encrypted state ----------
@@ -344,6 +394,10 @@ def main():
         send_daily(state)
     except Exception as e:  # weather service down -> try again next run (last_sent isn't set)
         print(f"daily message failed: {why(e)}")
+    try:
+        check_updates(state)
+    except Exception as e:  # try again next hour
+        print(f"update check failed: {why(e)}")
     # guarantees a commit at least monthly, so GitHub doesn't disable the schedule after 60 idle days
     state["heartbeat"] = time.strftime("%Y-%m")
     save_state(state)
