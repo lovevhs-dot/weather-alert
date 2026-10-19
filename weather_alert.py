@@ -388,6 +388,8 @@ def save_state(state):
 
 
 def main():
+    if not TOKEN or not CHAT_ID:  # clearer than Telegram's bare 404 when the secrets aren't added yet
+        raise SystemExit("TG_TOKEN or TG_CHAT_ID secret is missing: add them in Settings -> Secrets and variables -> Actions")
     state = load_state()
     handle_commands(state)
     try:
