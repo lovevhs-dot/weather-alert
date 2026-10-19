@@ -262,6 +262,10 @@ def handle_commands(state):
 def run_command(state, cmd, arg):
     place = state.get("place")
     if cmd == "/location" and arg:
+        if not STATE_KEY:  # the repo is public: never save a location unencrypted
+            send("🔒 Add the STATE_KEY secret first (Settings -> Secrets and variables -> Actions), "
+                 "then send /location again. Your location is only saved encrypted.")
+            return
         found = find_place(arg)
         if not found:
             send(f"❔ Couldn't find \"{arg}\". Try the English name or add the country, e.g. /location Portland, US")
