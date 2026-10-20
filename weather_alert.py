@@ -39,8 +39,12 @@ SEND_WINDOW_HOURS = 3  # if runs were delayed past this, skip the day instead of
 DAY_HOURS = range(6, 24)  # hours that count for "today" (rain at 3am doesn't need an umbrella)
 UPDATE_UNTIL_HOUR = 21  # hourly "weather got worse" checks stop at this local hour
 SUNSCREEN_UV = 3  # UV index from which sunscreen is suggested (WHO: 3+ = moderate, use protection)
-JACKET_DROP = 3  # suggest a jacket when today's high is this many degrees below yesterday's
-JACKET_LOW = 10  # ...or when the low is at or below this
+# Outfit from the coldest / warmest "feels like" temperature of the day, for the clothes actually owned:
+# light padded jacket, windbreaker, short sleeves
+PADDED_BELOW = 10  # feels-like at or below -> light padded jacket
+WINDBREAKER_BELOW = 19  # feels-like at or below -> windbreaker
+SHORT_SLEEVES_FROM = 25  # warmest feels-like at or above -> short sleeves are fine
+WINDY_GUSTS = 40  # km/h; on a padded-jacket day, add the windbreaker on top
 RAIN_NONE, RAIN_MAYBE, RAIN_YES, RAIN_SNOW = 0, 1, 2, 3  # ordered: a higher value is worse
 DUST_ORDER = ["good", "normal", "bad", "very bad"]
 
@@ -151,7 +155,7 @@ def hour_span(hours):
 def fetch_forecast(place):
     """(hourly forecast, daily temperatures, hourly air quality or None) from Open-Meteo, in local time."""
     fc = get_json(FORECAST_URL, latitude=place["lat"], longitude=place["lon"], timezone=place["tz"], past_days=1, forecast_days=1,
-                  hourly="precipitation_probability,precipitation,snowfall,uv_index",
+                  hourly="precipitation_probability,precipitation,snowfall,uv_index,apparent_temperature,wind_gusts_10m",
                   daily="temperature_2m_max,temperature_2m_min")
     try:
         air = get_json(AIR_URL, latitude=place["lat"], longitude=place["lon"], timezone=place["tz"], forecast_days=1,
@@ -186,6 +190,11 @@ def assess(place, hours):
         a["pm10"] = max((air["pm10"][i] or 0 for i in day), default=0)
         a["dust"] = max(level(a["pm25"], PM25_LEVELS), level(a["pm10"], PM10_LEVELS), key=DUST_ORDER.index)
     a["hi"], a["lo"] = daily["temperature_2m_max"][-1], daily["temperature_2m_min"][-1]
+    day = [i for i, t in enumerate(hourly["time"]) if t.startswith(today) and int(t[11:13]) in hours]
+    feels = [col(hourly, "apparent_temperature")[i] for i in day]
+    feels = [f for f in feels if f is not None] or [a["lo"], a["hi"]]  # no feels-like data -> plain temperatures
+    a["feels_lo"], a["feels_hi"] = min(feels), max(feels)
+    a["gusts"] = max((g for g in (col(hourly, "wind_gusts_10m")[i] for i in day) if g is not None), default=0)
     a["yesterday_hi"] = daily["temperature_2m_max"][0] if len(daily["time"]) > 1 else None
     return a
 
@@ -216,13 +225,17 @@ def mask_line(a):
     return f"😷 Mask — fine dust {a['dust']} (PM2.5 {a['pm25']:.0f})"
 
 
-def jacket_line(a):
-    drop = a["yesterday_hi"] - a["hi"] if a["yesterday_hi"] is not None else 0
-    if drop >= JACKET_DROP:
-        return f"🧥 Jacket — {drop:.0f}° colder than yesterday"
-    if a["lo"] <= JACKET_LOW:
-        return f"🧥 Jacket — chilly, low of {a['lo']:.0f}°"
-    return ""
+def outfit_line(a):
+    lo, hi = round(a["feels_lo"]), round(a["feels_hi"])
+    if lo <= PADDED_BELOW:
+        extra = " + windbreaker on top (windy)" if a["gusts"] >= WINDY_GUSTS else ""
+        return f"🧥 Light padded jacket{extra} — feels {lo}° at the coldest"
+    if lo <= WINDBREAKER_BELOW:
+        warm = ", short sleeves underneath" if hi >= SHORT_SLEEVES_FROM else ""
+        return f"🧥 Windbreaker{warm} — feels {lo}°–{hi}°"
+    if hi >= SHORT_SLEEVES_FROM:
+        return f"👕 Short sleeves — feels {lo}°–{hi}°"
+    return f"👕 No jacket needed — feels {lo}°–{hi}°"
 
 
 def today_brief(place):
@@ -233,8 +246,7 @@ def today_brief(place):
         bring.append(rain_line(a))
     else:
         skip.append("☔ Umbrella — no rain expected")
-    if jacket_line(a):
-        bring.append(jacket_line(a))
+    bring.insert(0, outfit_line(a))
     if sunscreen_needed(a):
         bring.append(sunscreen_line(a))
     else:
