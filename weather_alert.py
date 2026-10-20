@@ -45,6 +45,12 @@ PADDED_BELOW = 10  # feels-like at or below -> light padded jacket
 WINDBREAKER_BELOW = 19  # feels-like at or below -> windbreaker
 SHORT_SLEEVES_FROM = 25  # warmest feels-like at or above -> short sleeves are fine
 WINDY_GUSTS = 40  # km/h; on a padded-jacket day, add the windbreaker on top
+# Comfort line (shown only on notable days): discomfort index as the Korea Meteorological Administration uses it,
+# DI = 0.81T + 0.01RH(0.99T - 14.3) + 46.3 -> 75+ high (half of people uncomfortable), 80+ very high (almost everyone)
+DI_HIGH, DI_VERY_HIGH = 75, 80
+HEAT_FEELS = 33  # feels-like at or above -> heat caution
+FREEZING_FEELS = -10  # feels-like at or below -> limit time outside
+DRY_HUMIDITY = 30  # daytime average relative humidity at or below -> very dry air
 RAIN_NONE, RAIN_MAYBE, RAIN_YES, RAIN_SNOW = 0, 1, 2, 3  # ordered: a higher value is worse
 DUST_ORDER = ["good", "normal", "bad", "very bad"]
 
@@ -155,7 +161,8 @@ def hour_span(hours):
 def fetch_forecast(place):
     """(hourly forecast, daily temperatures, hourly air quality or None) from Open-Meteo, in local time."""
     fc = get_json(FORECAST_URL, latitude=place["lat"], longitude=place["lon"], timezone=place["tz"], past_days=1, forecast_days=1,
-                  hourly="precipitation_probability,precipitation,snowfall,uv_index,apparent_temperature,wind_gusts_10m",
+                  hourly="precipitation_probability,precipitation,snowfall,uv_index,apparent_temperature,wind_gusts_10m,"
+                         "temperature_2m,relative_humidity_2m",
                   daily="temperature_2m_max,temperature_2m_min")
     try:
         air = get_json(AIR_URL, latitude=place["lat"], longitude=place["lon"], timezone=place["tz"], forecast_days=1,
@@ -195,6 +202,12 @@ def assess(place, hours):
     feels = [f for f in feels if f is not None] or [a["lo"], a["hi"]]  # no feels-like data -> plain temperatures
     a["feels_lo"], a["feels_hi"] = min(feels), max(feels)
     a["gusts"] = max((g for g in (col(hourly, "wind_gusts_10m")[i] for i in day) if g is not None), default=0)
+    temp, rh, app = col(hourly, "temperature_2m"), col(hourly, "relative_humidity_2m"), col(hourly, "apparent_temperature")
+    a["di"] = {int(hourly["time"][i][11:13]): 0.81 * temp[i] + 0.01 * rh[i] * (0.99 * temp[i] - 14.3) + 46.3
+               for i in day if temp[i] is not None and rh[i] is not None}
+    a["hot_hours"] = [int(hourly["time"][i][11:13]) for i in day if app[i] is not None and app[i] >= HEAT_FEELS]
+    hums = [rh[i] for i in day if rh[i] is not None]
+    a["humidity"] = sum(hums) / len(hums) if hums else None
     a["yesterday_hi"] = daily["temperature_2m_max"][0] if len(daily["time"]) > 1 else None
     return a
 
@@ -238,6 +251,22 @@ def outfit_line(a):
     return f"👕 No jacket needed — feels {lo}°–{hi}°"
 
 
+def comfort_line(a):
+    """One line about how the day will feel, only when it's worth saying (the most serious one wins)."""
+    di_hours = lambda limit: [h for h, d in sorted(a["di"].items()) if d >= limit]
+    if a["hot_hours"]:
+        return f"🥵 Heat {hour_span(a['hot_hours'])} (feels {round(a['feels_hi'])}°) — drink water, don't stay outside long"
+    if di_hours(DI_VERY_HIGH):
+        return f"🥵 Very muggy {hour_span(di_hours(DI_VERY_HIGH))} — stay inside when you can"
+    if di_hours(DI_HIGH):
+        return f"💧 Muggy {hour_span(di_hours(DI_HIGH))} — light, breathable clothes"
+    if round(a["feels_lo"]) <= FREEZING_FEELS:
+        return f"🥶 Freezing (feels {round(a['feels_lo'])}°) — keep time outside short"
+    if a["humidity"] is not None and a["humidity"] <= DRY_HUMIDITY:
+        return f"🌵 Very dry air ({a['humidity']:.0f}%) — drink water, lip balm"
+    return ""
+
+
 def today_brief(place):
     """The morning message: what to bring, then what you don't need (so nothing looks forgotten)."""
     a = assess(place, DAY_HOURS)
@@ -247,6 +276,8 @@ def today_brief(place):
     else:
         skip.append("☔ Umbrella — no rain expected")
     bring.insert(0, outfit_line(a))
+    if comfort_line(a):
+        bring.insert(1, comfort_line(a))
     if sunscreen_needed(a):
         bring.append(sunscreen_line(a))
     else:
