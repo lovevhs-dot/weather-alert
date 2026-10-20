@@ -38,6 +38,9 @@ DEFAULT_TIME = "05:00"
 SEND_WINDOW_HOURS = 3  # if runs were delayed past this, skip the day instead of sending a stale "morning" message
 DAY_HOURS = range(6, 24)  # hours that count for "today" (rain at 3am doesn't need an umbrella)
 UPDATE_UNTIL_HOUR = 21  # hourly "weather got worse" checks stop at this local hour
+SUNSCREEN_UV = 3  # UV index from which sunscreen is suggested (WHO: 3+ = moderate, use protection)
+JACKET_DROP = 3  # suggest a jacket when today's high is this many degrees below yesterday's
+JACKET_LOW = 10  # ...or when the low is at or below this
 RAIN_NONE, RAIN_MAYBE, RAIN_YES, RAIN_SNOW = 0, 1, 2, 3  # ordered: a higher value is worse
 DUST_ORDER = ["good", "normal", "bad", "very bad"]
 
@@ -141,8 +144,8 @@ def level(value, levels):
 
 
 def hour_span(hours):
-    """[15, 16, 17] -> '15:00–18:00'; scattered hours -> first–last."""
-    return f"{hours[0]:02d}:00–{hours[-1] + 1:02d}:00"
+    """[15, 16, 17] -> '15:00–18:00'; scattered hours -> first–last; 12+ hours -> 'most of the day'."""
+    return "most of the day" if len(hours) >= 12 else f"{hours[0]:02d}:00–{hours[-1] + 1:02d}:00"
 
 
 def fetch_forecast(place):
@@ -176,7 +179,7 @@ def assess(place, hours):
         if found:
             a["rain"], a["rain_hours"] = kind, found
             break
-    a["uv_hours"] = [h for h, *_, u in rows if u is not None and u >= 6]
+    a["uv_hours"] = [h for h, *_, u in rows if u is not None and round(u) >= SUNSCREEN_UV]
     if air:
         day = [i for i, t in enumerate(air["time"]) if t.startswith(today) and int(t[11:13]) in hours]
         a["pm25"] = max((air["pm2_5"][i] or 0 for i in day), default=0)
@@ -189,12 +192,20 @@ def assess(place, hours):
 
 def rain_line(a):
     if a["rain"] == RAIN_SNOW:
-        return f"❄️ Snow — {hour_span(a['rain_hours'])}, take an umbrella and good shoes"
+        return f"❄️ Umbrella + good shoes — snow {hour_span(a['rain_hours'])}"
     if a["rain"] == RAIN_YES:
-        return f"☔ Umbrella — rain likely {hour_span(a['rain_hours'])} (up to {a['top']}%)"
+        return f"☔ Umbrella — rain {hour_span(a['rain_hours'])} (up to {a['top']}%)"
     if a["rain"] == RAIN_MAYBE:
-        return f"🌂 Small umbrella just in case — {a['top']}% chance around {hour_span(a['rain_hours'])}"
+        return f"🌂 Small umbrella, just in case — {a['top']}% chance {hour_span(a['rain_hours'])}"
     return ""
+
+
+def sunscreen_needed(a):
+    return round(a["uv"]) >= SUNSCREEN_UV
+
+
+def sunscreen_line(a):
+    return f"🧴 Sunscreen — UV {a['uv']:.0f} ({level(a['uv'], UV_LEVELS)}), {hour_span(a['uv_hours'])}"
 
 
 def mask_needed(a):
@@ -202,36 +213,44 @@ def mask_needed(a):
 
 
 def mask_line(a):
-    return f"😷 Mask — fine dust {a['dust']} (PM2.5 {a['pm25']:.0f} · PM10 {a['pm10']:.0f})"
+    return f"😷 Mask — fine dust {a['dust']} (PM2.5 {a['pm25']:.0f})"
+
+
+def jacket_line(a):
+    drop = a["yesterday_hi"] - a["hi"] if a["yesterday_hi"] is not None else 0
+    if drop >= JACKET_DROP:
+        return f"🧥 Jacket — {drop:.0f}° colder than yesterday"
+    if a["lo"] <= JACKET_LOW:
+        return f"🧥 Jacket — chilly, low of {a['lo']:.0f}°"
+    return ""
 
 
 def today_brief(place):
-    """The morning message, plus the values later checks compare against."""
+    """The morning message: what to bring, then what you don't need (so nothing looks forgotten)."""
     a = assess(place, DAY_HOURS)
-    bring, notes = [], []
+    bring, skip = [], []
     if a["rain"]:
         bring.append(rain_line(a))
-    if a["uv"] >= 6:
-        bring.append(f"🧴 Sunscreen — UV {level(a['uv'], UV_LEVELS)} ({a['uv']:.0f}), strongest {hour_span(a['uv_hours'])}")
-    elif a["uv"] >= 3:
-        bring.append(f"🧴 Sunscreen if you're outside long — UV {level(a['uv'], UV_LEVELS)} ({a['uv']:.0f})")
+    else:
+        skip.append("☔ Umbrella — no rain expected")
+    if jacket_line(a):
+        bring.append(jacket_line(a))
+    if sunscreen_needed(a):
+        bring.append(sunscreen_line(a))
+    else:
+        skip.append(f"🧴 Sunscreen — UV low ({a['uv']:.0f})")
     if mask_needed(a):
         bring.append(mask_line(a))
     elif a["dust"]:
-        notes.append(f"🌫 Air {a['dust']}")
+        skip.append(f"😷 Mask — air {a['dust']}")
 
-    temp = f"🌡 {a['hi']:.0f}° / {a['lo']:.0f}°"
-    if a["yesterday_hi"] is not None:
-        diff = a["hi"] - a["yesterday_hi"]
-        if diff <= -3:
-            temp += f" ({-diff:.0f}° colder than yesterday — bring a layer)"
-        elif diff >= 3:
-            temp += f" ({diff:.0f}° warmer than yesterday)"
-    notes.insert(0, temp)
-
-    head = f"☀️ {datetime.now(ZoneInfo(place['tz'])):%a %m/%d} · {place['name']}"
-    body = "\n".join(bring) if bring else "✅ Nothing extra to bring today"
-    return f"{head}\n\n{body}\n\n" + "\n".join(notes), {"rain": a["rain"], "mask": mask_needed(a)}
+    head = f"☀️ {datetime.now(ZoneInfo(place['tz'])):%a %m/%d} · {place['name']} · {a['hi']:.0f}° / {a['lo']:.0f}°"
+    parts = [head]
+    parts.append("Bring:\n" + "\n".join(bring) if bring else "✅ Nothing extra to bring today")
+    if skip:
+        parts.append("Not needed:\n" + "\n".join(skip))
+    seen = {"rain": a["rain"], "mask": mask_needed(a), "uv": sunscreen_needed(a)}
+    return "\n\n".join(parts), seen
 
 
 # ---------- Telegram commands ----------
@@ -322,7 +341,7 @@ def send_daily(state):
 
 
 def check_updates(state):
-    """After the morning message, re-check hourly and message only if things got worse (rain, snow, fine dust)."""
+    """After the morning message, re-check hourly and message only if something new is needed (rain, sun, dust)."""
     place, seen = state.get("place"), state.get("today")
     if not place or not seen:
         return
@@ -333,12 +352,15 @@ def check_updates(state):
     a = assess(place, range(now.hour, 24))  # only what's still ahead today
     news = []
     if a["rain"] >= RAIN_YES and a["rain"] > seen["rain"]:
-        news.append(rain_line(a) + " — changed since this morning")
+        news.append(rain_line(a))
+    if sunscreen_needed(a) and not seen.get("uv"):
+        news.append(sunscreen_line(a))
     if mask_needed(a) and not seen["mask"]:
-        news.append(mask_line(a) + " — got worse since this morning")
+        news.append(mask_line(a))
     if news:
-        send(f"⚠️ Weather update · {place['name']}\n\n" + "\n".join(news))
+        send(f"⚠️ Weather changed · {place['name']}\n\nBring now:\n" + "\n".join(news))
         seen["rain"] = max(seen["rain"], a["rain"])
+        seen["uv"] = seen.get("uv") or sunscreen_needed(a)
         seen["mask"] = seen["mask"] or mask_needed(a)
 
 
