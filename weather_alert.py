@@ -244,7 +244,7 @@ def outfit_line(a):
         return f"🧥 Light padded jacket{extra} — feels {lo}° at the coldest"
     if lo <= WINDBREAKER_BELOW:
         warm = ", short sleeves underneath" if hi >= SHORT_SLEEVES_FROM else ""
-        return f"🧥 Windbreaker{warm} — feels {lo}°–{hi}°"
+        return f"🌬️ Windbreaker{warm} — feels {lo}°–{hi}°"
     if hi >= SHORT_SLEEVES_FROM:
         return f"👕 Short sleeves — feels {lo}°–{hi}°"
     return f"👕 No jacket needed — feels {lo}°–{hi}°"
