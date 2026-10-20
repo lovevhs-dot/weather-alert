@@ -241,7 +241,7 @@ def outfit_line(a):
     lo, hi = round(a["feels_lo"]), round(a["feels_hi"])
     if lo <= PADDED_BELOW:
         extra = " + windbreaker on top (windy)" if a["gusts"] >= WINDY_GUSTS else ""
-        return f"🧥 Light padded jacket{extra} — feels {lo}° at the coldest"
+        return f"🪶 Light padded jacket{extra} — feels {lo}° at the coldest"
     if lo <= WINDBREAKER_BELOW:
         warm = ", short sleeves underneath" if hi >= SHORT_SLEEVES_FROM else ""
         return f"🌬️ Windbreaker{warm} — feels {lo}°–{hi}°"
