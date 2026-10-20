@@ -45,14 +45,12 @@ PADDED_BELOW = 10  # feels-like at or below -> light padded jacket
 WINDBREAKER_BELOW = 19  # feels-like at or below -> windbreaker
 SHORT_SLEEVES_FROM = 25  # warmest feels-like at or above -> short sleeves are fine
 WINDY_GUSTS = 40  # km/h; on a padded-jacket day, add the windbreaker on top
-# Comfort line (shown only on notable days): discomfort index as the Korea Meteorological Administration uses it,
-# DI = 0.81T + 0.01RH(0.99T - 14.3) + 46.3 -> 75+ high (half of people uncomfortable), 80+ very high (almost everyone)
-DI_HIGH, DI_VERY_HIGH = 75, 80
-HEAT_FEELS = 33  # feels-like at or above -> heat caution
-FREEZING_FEELS = -10  # feels-like at or below -> limit time outside
-DRY_HUMIDITY = 30  # daytime average relative humidity at or below -> very dry air
+# Comfort line (shown only on notable days), from internationally used indices:
+# Heat Index (US National Weather Service, Rothfusz): 27+ caution, 32+ extreme caution, 41+ danger (°C)
+HEAT_CAUTION, HEAT_EXTREME, HEAT_DANGER = 27, 32, 41
+# Wind chill (2001 joint US/Canada index): -10 or below uncomfortable/risk if outside long, -28 or below frostbite risk
+CHILL_COLD, CHILL_FROSTBITE = -10, -28
 RAIN_NONE, RAIN_MAYBE, RAIN_YES, RAIN_SNOW = 0, 1, 2, 3  # ordered: a higher value is worse
-DUST_ORDER = ["good", "normal", "bad", "very bad"]
 
 GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
@@ -75,9 +73,10 @@ COMMANDS = [
     {"command": "settings", "description": "Show location and time"},
 ]
 
-# Korean air quality standards (µg/m³): good / normal / bad / very bad
-PM25_LEVELS = [(15, "good"), (35, "normal"), (75, "bad"), (float("inf"), "very bad")]
-PM10_LEVELS = [(30, "good"), (80, "normal"), (150, "bad"), (float("inf"), "very bad")]
+# WHO Air Quality Guidelines 2021, 24-hour means (µg/m³): guideline level, and interim target 3 above which a mask is
+# suggested (WHO doesn't name categories, so the message shows how many times the guideline the air is)
+WHO_PM25, WHO_PM10 = 15, 45
+MASK_PM25, MASK_PM10 = 37.5, 75
 # WHO UV index scale
 UV_LEVELS = [(2, "low"), (5, "moderate"), (7, "high"), (10, "very high"), (float("inf"), "extreme")]
 
@@ -162,7 +161,7 @@ def fetch_forecast(place):
     """(hourly forecast, daily temperatures, hourly air quality or None) from Open-Meteo, in local time."""
     fc = get_json(FORECAST_URL, latitude=place["lat"], longitude=place["lon"], timezone=place["tz"], past_days=1, forecast_days=1,
                   hourly="precipitation_probability,precipitation,snowfall,uv_index,apparent_temperature,wind_gusts_10m,"
-                         "temperature_2m,relative_humidity_2m",
+                         "temperature_2m,relative_humidity_2m,wind_speed_10m",
                   daily="temperature_2m_max,temperature_2m_min")
     try:
         air = get_json(AIR_URL, latitude=place["lat"], longitude=place["lon"], timezone=place["tz"], forecast_days=1,
@@ -193,21 +192,20 @@ def assess(place, hours):
     a["uv_hours"] = [h for h, *_, u in rows if u is not None and round(u) >= SUNSCREEN_UV]
     if air:
         day = [i for i, t in enumerate(air["time"]) if t.startswith(today) and int(t[11:13]) in hours]
-        a["pm25"] = max((air["pm2_5"][i] or 0 for i in day), default=0)
-        a["pm10"] = max((air["pm10"][i] or 0 for i in day), default=0)
-        a["dust"] = max(level(a["pm25"], PM25_LEVELS), level(a["pm10"], PM10_LEVELS), key=DUST_ORDER.index)
+        mean = lambda xs: sum(xs) / len(xs) if xs else 0  # WHO guidelines are 24-hour means, not hourly peaks
+        a["pm25"] = mean([air["pm2_5"][i] for i in day if air["pm2_5"][i] is not None])
+        a["pm10"] = mean([air["pm10"][i] for i in day if air["pm10"][i] is not None])
+        a["dust"] = "ok" if a["pm25"] <= WHO_PM25 and a["pm10"] <= WHO_PM10 else "above"
     a["hi"], a["lo"] = daily["temperature_2m_max"][-1], daily["temperature_2m_min"][-1]
     day = [i for i, t in enumerate(hourly["time"]) if t.startswith(today) and int(t[11:13]) in hours]
     feels = [col(hourly, "apparent_temperature")[i] for i in day]
     feels = [f for f in feels if f is not None] or [a["lo"], a["hi"]]  # no feels-like data -> plain temperatures
     a["feels_lo"], a["feels_hi"] = min(feels), max(feels)
     a["gusts"] = max((g for g in (col(hourly, "wind_gusts_10m")[i] for i in day) if g is not None), default=0)
-    temp, rh, app = col(hourly, "temperature_2m"), col(hourly, "relative_humidity_2m"), col(hourly, "apparent_temperature")
-    a["di"] = {int(hourly["time"][i][11:13]): 0.81 * temp[i] + 0.01 * rh[i] * (0.99 * temp[i] - 14.3) + 46.3
-               for i in day if temp[i] is not None and rh[i] is not None}
-    a["hot_hours"] = [int(hourly["time"][i][11:13]) for i in day if app[i] is not None and app[i] >= HEAT_FEELS]
-    hums = [rh[i] for i in day if rh[i] is not None]
-    a["humidity"] = sum(hums) / len(hums) if hums else None
+    temp, rh, wind = col(hourly, "temperature_2m"), col(hourly, "relative_humidity_2m"), col(hourly, "wind_speed_10m")
+    hour_of = lambda i: int(hourly["time"][i][11:13])
+    a["heat"] = {hour_of(i): heat_index(temp[i], rh[i]) for i in day if temp[i] is not None and rh[i] is not None}
+    a["chill"] = min((wind_chill(temp[i], wind[i] or 0) for i in day if temp[i] is not None), default=None)
     a["yesterday_hi"] = daily["temperature_2m_max"][0] if len(daily["time"]) > 1 else None
     return a
 
@@ -231,11 +229,12 @@ def sunscreen_line(a):
 
 
 def mask_needed(a):
-    return a["dust"] in ("bad", "very bad")
+    return a["pm25"] > MASK_PM25 or a["pm10"] > MASK_PM10
 
 
 def mask_line(a):
-    return f"😷 Mask — fine dust {a['dust']} (PM2.5 {a['pm25']:.0f})"
+    times = max(a["pm25"] / WHO_PM25, a["pm10"] / WHO_PM10)
+    return f"😷 Mask — fine dust {times:.1f}× the WHO guideline (PM2.5 {a['pm25']:.0f} · PM10 {a['pm10']:.0f})"
 
 
 def outfit_line(a):
@@ -251,19 +250,42 @@ def outfit_line(a):
     return f"👕 No jacket needed — feels {lo}°–{hi}°"
 
 
+def heat_index(t_c, rh):
+    """US National Weather Service heat index (°C in, °C out): simple formula, Rothfusz regression when it's hot."""
+    t = t_c * 9 / 5 + 32
+    hi = 0.5 * (t + 61 + (t - 68) * 1.2 + rh * 0.094)
+    if (hi + t) / 2 >= 80:
+        hi = (-42.379 + 2.04901523 * t + 10.14333127 * rh - 0.22475541 * t * rh - 0.00683783 * t * t
+              - 0.05481717 * rh * rh + 0.00122874 * t * t * rh + 0.00085282 * t * rh * rh - 0.00000199 * t * t * rh * rh)
+        if rh < 13 and 80 <= t <= 112:
+            hi -= (13 - rh) / 4 * ((17 - abs(t - 95)) / 17) ** 0.5
+        elif rh > 85 and 80 <= t <= 87:
+            hi += (rh - 85) / 10 * (87 - t) / 5
+    return (hi - 32) * 5 / 9
+
+
+def wind_chill(t_c, wind_kmh):
+    """2001 US/Canada wind chill (°C, km/h); only defined at 10°C or below with some wind, else the temperature."""
+    if t_c > 10 or wind_kmh < 4.8:
+        return t_c
+    v = wind_kmh ** 0.16
+    return 13.12 + 0.6215 * t_c - 11.37 * v + 0.3965 * t_c * v
+
+
 def comfort_line(a):
     """One line about how the day will feel, only when it's worth saying (the most serious one wins)."""
-    di_hours = lambda limit: [h for h, d in sorted(a["di"].items()) if d >= limit]
-    if a["hot_hours"]:
-        return f"🥵 Heat {hour_span(a['hot_hours'])} (feels {round(a['feels_hi'])}°) — drink water, don't stay outside long"
-    if di_hours(DI_VERY_HIGH):
-        return f"🥵 Very muggy {hour_span(di_hours(DI_VERY_HIGH))} — stay inside when you can"
-    if di_hours(DI_HIGH):
-        return f"💧 Muggy {hour_span(di_hours(DI_HIGH))} — light, breathable clothes"
-    if round(a["feels_lo"]) <= FREEZING_FEELS:
-        return f"🥶 Freezing (feels {round(a['feels_lo'])}°) — keep time outside short"
-    if a["humidity"] is not None and a["humidity"] <= DRY_HUMIDITY:
-        return f"🌵 Very dry air ({a['humidity']:.0f}%) — drink water, lip balm"
+    hot = lambda limit: [h for h, x in sorted(a["heat"].items()) if x >= limit]
+    peak = round(max(a["heat"].values(), default=0))
+    if hot(HEAT_DANGER):
+        return f"🥵 Dangerous heat {hour_span(hot(HEAT_DANGER))} (heat index {peak}°) — stay inside, drink water"
+    if hot(HEAT_EXTREME):
+        return f"🥵 Heat {hour_span(hot(HEAT_EXTREME))} (heat index {peak}°) — drink water, don't stay outside long"
+    if hot(HEAT_CAUTION):
+        return f"💧 Hot & sticky {hour_span(hot(HEAT_CAUTION))} (heat index {peak}°) — light clothes, take breaks"
+    if a["chill"] is not None and a["chill"] <= CHILL_FROSTBITE:
+        return f"🥶 Frostbite risk (wind chill {round(a['chill'])}°) — cover skin, keep time outside short"
+    if a["chill"] is not None and a["chill"] <= CHILL_COLD:
+        return f"🥶 Very cold (wind chill {round(a['chill'])}°) — hat & gloves, don't stay outside long"
     return ""
 
 
@@ -284,8 +306,11 @@ def today_brief(place):
         skip.append(f"🧴 Sunscreen — UV low ({a['uv']:.0f})")
     if mask_needed(a):
         bring.append(mask_line(a))
+    elif a["dust"] == "ok":
+        skip.append("😷 Mask — air within WHO guideline")
     elif a["dust"]:
-        skip.append(f"😷 Mask — air {a['dust']}")
+        times = max(a["pm25"] / WHO_PM25, a["pm10"] / WHO_PM10)
+        skip.append(f"😷 Mask — air {times:.1f}× the WHO guideline (mask from {MASK_PM25 / WHO_PM25:.1f}×)")
 
     head = f"☀️ {datetime.now(ZoneInfo(place['tz'])):%a %m/%d} · {place['name']} · {a['hi']:.0f}° / {a['lo']:.0f}°"
     parts = [head]
