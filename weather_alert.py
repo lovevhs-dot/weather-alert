@@ -38,7 +38,7 @@ DEFAULT_TIME = "05:00"
 SEND_WINDOW_HOURS = 3  # if runs were delayed past this, skip the day instead of sending a stale "morning" message
 DAY_HOURS = range(6, 24)  # hours that count for "today" (rain at 3am doesn't need an umbrella)
 UPDATE_UNTIL_HOUR = 21  # hourly "weather got worse" checks stop at this local hour
-SUNSCREEN_UV = 3  # UV index from which sunscreen is suggested (WHO: 3+ = moderate, use protection)
+SUNSCREEN_UV = 3  # UV index from which sunscreen and sunglasses are suggested (WHO: 3+ = protection required)
 # Outfit from the coldest / warmest "feels like" temperature of the day, for the clothes actually owned:
 # light padded jacket, windbreaker, short sleeves
 # One outer layer + what goes under it, from the coldest feels-like temperature of the day:
@@ -195,6 +195,7 @@ def assess(place, hours):
             a["rain"], a["rain_hours"] = kind, found
             break
     a["uv_hours"] = [h for h, *_, u in rows if u is not None and round(u) >= SUNSCREEN_UV]
+    a["parasol_hours"] = [h for h, *_, u in rows if u is not None and round(u) >= PARASOL_UV]
     if air:
         day = [i for i, t in enumerate(air["time"]) if t.startswith(today) and int(t[11:13]) in hours]
         mean = lambda xs: sum(xs) / len(xs) if xs else 0  # WHO guidelines are 24-hour means, not hourly peaks
@@ -229,8 +230,11 @@ def sunscreen_needed(a):
 
 
 def sunscreen_line(a):
-    parasol = " + ⛱ parasol" if round(a["uv"]) >= PARASOL_UV else ""
-    return f"🧴 Sunscreen{parasol} — UV {a['uv']:.0f} ({level(a['uv'], UV_LEVELS)}), {hour_span(a['uv_hours'])}"
+    """Sun protection with its own hours: sunscreen + sunglasses at UV 3+, a parasol (shade) only while UV is 8+."""
+    line = f"🧴 Sunscreen + 🕶 sunglasses — {hour_span(a['uv_hours'])} (UV up to {a['uv']:.0f}, {level(a['uv'], UV_LEVELS)})"
+    if a["parasol_hours"]:
+        line += f"\n⛱ Parasol — {hour_span(a['parasol_hours'])} (UV 8+, stay in the shade)"
+    return line
 
 
 def mask_needed(a):
@@ -312,7 +316,7 @@ def today_brief(place):
     if sunscreen_needed(a):
         bring.append(sunscreen_line(a))
     else:
-        skip.append(f"🧴 Sunscreen — UV low ({a['uv']:.0f})")
+        skip.append(f"🧴 Sunscreen & sunglasses — UV low ({a['uv']:.0f})")
     if mask_needed(a):
         bring.append(mask_line(a))
     elif a["dust"] == "ok":
