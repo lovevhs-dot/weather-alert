@@ -41,10 +41,15 @@ UPDATE_UNTIL_HOUR = 21  # hourly "weather got worse" checks stop at this local h
 SUNSCREEN_UV = 3  # UV index from which sunscreen is suggested (WHO: 3+ = moderate, use protection)
 # Outfit from the coldest / warmest "feels like" temperature of the day, for the clothes actually owned:
 # light padded jacket, windbreaker, short sleeves
-PADDED_BELOW = 10  # feels-like at or below -> light padded jacket
-WINDBREAKER_BELOW = 19  # feels-like at or below -> windbreaker
+# One outer layer + what goes under it, from the coldest feels-like temperature of the day:
+#   <= 5 padded + inner layer · 6-10 padded + short sleeves · 11-14 windbreaker + inner layer
+#   15-19 windbreaker + short sleeves · 20+ no jacket
+PADDED_INNER_BELOW = 5
+PADDED_BELOW = 10
+WINDBREAKER_INNER_BELOW = 14
+WINDBREAKER_BELOW = 19
 SHORT_SLEEVES_FROM = 25  # warmest feels-like at or above -> short sleeves are fine
-WINDY_GUSTS = 40  # km/h; on a padded-jacket day, add the windbreaker on top
+PARASOL_UV = 8  # WHO: 8+ is "very high" -> extra protection, avoid the midday sun
 # Comfort line (shown only on notable days), from internationally used indices:
 # Heat Index (US National Weather Service, Rothfusz): 27+ caution, 32+ extreme caution, 41+ danger (°C)
 HEAT_CAUTION, HEAT_EXTREME, HEAT_DANGER = 27, 32, 41
@@ -160,7 +165,7 @@ def hour_span(hours):
 def fetch_forecast(place):
     """(hourly forecast, daily temperatures, hourly air quality or None) from Open-Meteo, in local time."""
     fc = get_json(FORECAST_URL, latitude=place["lat"], longitude=place["lon"], timezone=place["tz"], past_days=1, forecast_days=1,
-                  hourly="precipitation_probability,precipitation,snowfall,uv_index,apparent_temperature,wind_gusts_10m,"
+                  hourly="precipitation_probability,precipitation,snowfall,uv_index,apparent_temperature,"
                          "temperature_2m,relative_humidity_2m,wind_speed_10m",
                   daily="temperature_2m_max,temperature_2m_min")
     try:
@@ -201,7 +206,6 @@ def assess(place, hours):
     feels = [col(hourly, "apparent_temperature")[i] for i in day]
     feels = [f for f in feels if f is not None] or [a["lo"], a["hi"]]  # no feels-like data -> plain temperatures
     a["feels_lo"], a["feels_hi"] = min(feels), max(feels)
-    a["gusts"] = max((g for g in (col(hourly, "wind_gusts_10m")[i] for i in day) if g is not None), default=0)
     temp, rh, wind = col(hourly, "temperature_2m"), col(hourly, "relative_humidity_2m"), col(hourly, "wind_speed_10m")
     hour_of = lambda i: int(hourly["time"][i][11:13])
     a["heat"] = {hour_of(i): heat_index(temp[i], rh[i]) for i in day if temp[i] is not None and rh[i] is not None}
@@ -225,7 +229,8 @@ def sunscreen_needed(a):
 
 
 def sunscreen_line(a):
-    return f"🧴 Sunscreen — UV {a['uv']:.0f} ({level(a['uv'], UV_LEVELS)}), {hour_span(a['uv_hours'])}"
+    parasol = " + ⛱ parasol" if round(a["uv"]) >= PARASOL_UV else ""
+    return f"🧴 Sunscreen{parasol} — UV {a['uv']:.0f} ({level(a['uv'], UV_LEVELS)}), {hour_span(a['uv_hours'])}"
 
 
 def mask_needed(a):
@@ -238,16 +243,20 @@ def mask_line(a):
 
 
 def outfit_line(a):
+    """One outer layer and what to wear under it (inner layer or short sleeves)."""
     lo, hi = round(a["feels_lo"]), round(a["feels_hi"])
+    feels = f"feels {lo}°–{hi}°"
+    if lo <= PADDED_INNER_BELOW:
+        return f"🪶 Light padded jacket + inner layer — {feels}"
     if lo <= PADDED_BELOW:
-        extra = " + windbreaker on top (windy)" if a["gusts"] >= WINDY_GUSTS else ""
-        return f"🪶 Light padded jacket{extra} — feels {lo}° at the coldest"
+        return f"🪶 Light padded jacket + short sleeves — {feels}"
+    if lo <= WINDBREAKER_INNER_BELOW:
+        return f"🌬️ Windbreaker + inner layer — {feels}"
     if lo <= WINDBREAKER_BELOW:
-        warm = ", short sleeves underneath" if hi >= SHORT_SLEEVES_FROM else ""
-        return f"🌬️ Windbreaker{warm} — feels {lo}°–{hi}°"
+        return f"🌬️ Windbreaker + short sleeves — {feels}"
     if hi >= SHORT_SLEEVES_FROM:
-        return f"👕 Short sleeves — feels {lo}°–{hi}°"
-    return f"👕 No jacket needed — feels {lo}°–{hi}°"
+        return f"👕 Short sleeves — {feels}"
+    return f"👕 No jacket needed — {feels}"
 
 
 def heat_index(t_c, rh):
